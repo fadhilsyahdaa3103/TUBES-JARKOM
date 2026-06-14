@@ -1,309 +1,269 @@
 import socket
 import threading
-import argparse
 import os
 import sys
-import time
 import datetime
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KONFIGURASI DEFAULT
-# ─────────────────────────────────────────────────────────────────────────────
-PROXY_HOST      = "0.0.0.0"
-PROXY_PORT      = 8080
+# ─────────────────────────────────────────
+#  KONFIGURASI
+# ─────────────────────────────────────────
+PROXY_HOST = "0.0.0.0"
+PROXY_PORT = 8080
 
-MAIN_SERVER_TCP_PORT   = 8000
-BACKUP_SERVER_TCP_PORT = 8001
+SERVER_HOST = "127.0.0.1"   # Alamat web server (local)
+SERVER_PORT = 8000          # port web server
 
-CONNECT_TIMEOUT = 5      # detik — timeout saat coba konek ke server
-RECV_TIMEOUT    = 15     # detik — timeout saat tunggu response dari server
+UDP_HOST = "0.0.0.0"
+UDP_PORT = 9091
 
-CACHE_DIR       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy_cache")
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache") # Direktori untuk menyimpan cache
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOCK GLOBAL untuk operasi tulis cache (mencegah race condition)
-# ─────────────────────────────────────────────────────────────────────────────
+SERVER_TIMEOUT = 5          # Timeout (second) 
+
+
+# ─────────────────────────────────────────
+#  INISIALISASI CACHE
+# ─────────────────────────────────────────
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Lock untuk mencegah race condition saat tulis/baca cache
 cache_lock = threading.Lock()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UTILITAS
-# ─────────────────────────────────────────────────────────────────────────────
-def timestamp():
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
-
-def log(label: str, msg: str):
-    print(f"[{timestamp()}] [{label}] {msg}", flush=True)
-
-
-def path_to_cache_key(path: str) -> str:
-    """
-    Mengubah URL path menjadi nama file cache yang aman.
-    Contoh: '/index.html' → 'index.html'
-             '/'           → '_root_'
-    """
-    safe = path.strip("/").replace("/", "__")
-    if not safe:
-        safe = "_root_"
-    return safe + ".cache"
-
-
-def read_cache(cache_key: str) -> bytes | None:
-    """Membaca file cache. Return None jika tidak ada."""
-    cache_path = os.path.join(CACHE_DIR, cache_key)
+# ─────────────────────────────────────────
+#  HELPER: LOGGING (OTOMATIS SIMPAN)
+# ─────────────────────────────────────────
+def log(tag, message):
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    log_entry = f"[{now}] [{tag}] {message}"
+    print(log_entry)
+    
+    # Buat folder 'logs' jika belum ada bray
+    os.makedirs("logs", exist_ok=True)
+    
     try:
-        with open(cache_path, "rb") as f:
-            return f.read()
-    except FileNotFoundError:
-        return None
+        # Simpan di dalam folder logs/
+        with open(os.path.join("logs", "log_proxy.txt"), "a", encoding="utf-8") as f:
+            f.write(log_entry + "\n")
     except Exception as e:
-        log("CACHE", f"Error membaca cache '{cache_key}': {e}")
-        return None
+        print(f"Gagal menulis ke log file: {e}")
+
+# ─────────────────────────────────────────
+#  HELPER: KONVERSI URL PATH → NAMA FILE CACHE
+# ─────────────────────────────────────────
+def path_to_cache_filename(path):
+    safe = path.lstrip("/").replace("/", "_")
+    if not safe:
+        safe = "index.html"
+    return os.path.join(CACHE_DIR, safe)
 
 
-def write_cache(cache_key: str, data: bytes):
-    """
-    Menulis data ke file cache. Dilindungi threading.Lock untuk mencegah
-    race condition saat beberapa thread menulis bersamaan.
-    """
-    cache_path = os.path.join(CACHE_DIR, cache_key)
+# ─────────────────────────────────────────
+#  HELPER: CEK CACHE
+# ─────────────────────────────────────────
+def get_from_cache(path):
+    """Return bytes isi cache jika ada, None jika tidak."""
+    cache_file = path_to_cache_filename(path)
     with cache_lock:
-        try:
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            with open(cache_path, "wb") as f:
-                f.write(data)
-        except Exception as e:
-            log("CACHE", f"Error menulis cache '{cache_key}': {e}")
+        if os.path.exists(cache_file):
+            with open(cache_file, "rb") as f:
+                return f.read()
+    return None
 
 
-def build_error_response(status_code: int, status_text: str, detail: str = "") -> bytes:
-    """Membuat HTTP error response sederhana."""
-    # Coba baca file HTML error kustom dari folder HTML/status/ milik server
-    # Jika tidak ada, gunakan fallback teks biasa
-    body = (
-        f"<html><head><title>{status_code} {status_text}</title></head>"
-        f"<body><h1>{status_code} {status_text}</h1>"
-        f"<p>{detail}</p>"
-        f"<hr><em>Proxy Server - Tugas Besar Jarkom</em></body></html>"
-    ).encode("utf-8")
+# ─────────────────────────────────────────
+#  HELPER: SIMPAN KE CACHE
+# ─────────────────────────────────────────
+def save_to_cache(path, data):
+    """Simpan response bytes ke file cache."""
+    cache_file = path_to_cache_filename(path)
+    with cache_lock:
+        with open(cache_file, "wb") as f:
+            f.write(data)
 
-    headers = (
+
+# ─────────────────────────────────────────
+#  HELPER: FORWARD REQUEST KE WEB SERVER
+# ─────────────────────────────────────────
+def forward_to_server(raw_request):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(SERVER_TIMEOUT)
+        s.connect((SERVER_HOST, SERVER_PORT))
+        s.sendall(raw_request)
+
+        response = b""
+        while True:
+            try:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            except socket.timeout:
+                break
+
+        s.close()
+
+        if not response:
+            return None, "Empty response from server"
+        return response, None
+
+    except socket.timeout:
+        return None, "timeout"
+    except ConnectionRefusedError:
+        return None, "connection refused"
+    except Exception as e:
+        return None, str(e)
+
+
+# ─────────────────────────────────────────
+#  HELPER: BANGUN ERROR RESPONSE
+# ─────────────────────────────────────────
+def build_error_response(status_code, status_text, message=""):
+    body = f"<h1>{status_code} {status_text}</h1><p>{message}</p>".encode()
+    header = (
         f"HTTP/1.1 {status_code} {status_text}\r\n"
         f"Content-Type: text/html; charset=utf-8\r\n"
         f"Content-Length: {len(body)}\r\n"
         f"Connection: close\r\n"
         f"\r\n"
     )
-    return headers.encode("utf-8") + body
+    return header.encode() + body
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FUNGSI FORWARD REQUEST KE BACKEND SERVER
-# ─────────────────────────────────────────────────────────────────────────────
-def forward_to_server(server_ip: str, server_port: int, raw_request: bytes) -> bytes:
-    """
-    Membuka koneksi TCP ke server backend, mengirim raw HTTP request,
-    dan menerima full response (header + body).
-    
-    Raises:
-        ConnectionRefusedError jika server tidak bisa dikoneksi.
-        socket.timeout jika server tidak merespons dalam waktu CONNECT_TIMEOUT.
-        Exception untuk error lainnya.
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(CONNECT_TIMEOUT)
-    s.connect((server_ip, server_port))   # Raise ConnectionRefusedError / timeout jika gagal
-    s.settimeout(RECV_TIMEOUT)
-
-    s.sendall(raw_request)
-
-    # Terima response hingga koneksi ditutup server
-    response = b""
-    while True:
-        chunk = s.recv(65536)
-        if not chunk:
-            break
-        response += chunk
-
-    s.close()
-    return response
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HANDLER PER CLIENT (dijalankan di thread terpisah)
-# ─────────────────────────────────────────────────────────────────────────────
-def handle_client(conn: socket.socket, addr: tuple,
-                  main_ip: str, backup_ip: str):
-    """
-    Alur utama:
-    1. Terima request dari client
-    2. Parse URL path
-    3. Cek Cache HIT → kirim dari cache (sangat cepat)
-    4. Cache MISS → coba Server Utama → jika gagal, coba Server Cadangan
-    5. Cache response baru, kirim ke client
-    6. Jika kedua server gagal → 504 Gateway Timeout
-    """
-    client_ip, client_port = addr
-    t_start = time.perf_counter()
+# ─────────────────────────────────────────
+#  HANDLE SATU CLIENT
+# ─────────────────────────────────────────
+def handle_client(conn, addr):
+    client_ip = addr[0]
+    start_time = datetime.datetime.now()
 
     try:
-        conn.settimeout(15)
-
-        # ── 1. Terima raw HTTP request dari client ───────────────────────────
-        raw_request = b""
-        while b"\r\n\r\n" not in raw_request:
+        raw = b""
+        while b"\r\n\r\n" not in raw:
             chunk = conn.recv(4096)
             if not chunk:
                 break
-            raw_request += chunk
+            raw += chunk
 
-        if not raw_request:
+        if not raw:
             return
 
-        # ── 2. Parse request line ────────────────────────────────────────────
-        first_line = raw_request.split(b"\r\n")[0].decode("utf-8", errors="replace")
-        parts = first_line.split()
-        if len(parts) < 2:
-            conn.sendall(build_error_response(400, "Bad Request", "Request tidak valid."))
-            return
-
-        method = parts[0]
-        path   = parts[1]
-
-        # ── 3. Cek Cache ─────────────────────────────────────────────────────
-        cache_key   = path_to_cache_key(path)
-        cached_data = read_cache(cache_key)
-
-        if cached_data is not None:
-            # ─── CACHE HIT ───────────────────────────────────────────────────
-            elapsed_ms = (time.perf_counter() - t_start) * 1000
-            conn.sendall(cached_data)
-            log("PROXY",
-                f"{client_ip}:{client_port} | GET {path} | "
-                f"HIT (cache) | {elapsed_ms:.2f}ms")
-            return
-
-        # ── 4. CACHE MISS → Forward ke Server ────────────────────────────────
-        log("PROXY",
-            f"{client_ip}:{client_port} | GET {path} | MISS → menghubungi server...")
-
-        response_data = None
-        server_used   = None
-
-        # Coba Server Utama terlebih dahulu
         try:
-            response_data = forward_to_server(main_ip, MAIN_SERVER_TCP_PORT, raw_request)
-            server_used   = f"Server Utama ({main_ip}:{MAIN_SERVER_TCP_PORT})"
+            text = raw.decode("utf-8", errors="replace")
+            request_line = text.split("\r\n")[0]
+            parts = request_line.split(" ")
+            method = parts[0]
+            path   = parts[1] if len(parts) > 1 else "/"
+        except Exception:
+            conn.sendall(build_error_response(400, "Bad Request", "Malformed HTTP request"))
+            log("PROXY", f"{client_ip} - 400 Bad Request")
+            return
 
-        except (ConnectionRefusedError, socket.timeout, OSError) as e_main:
-            log("PROXY",
-                f"{client_ip}:{client_port} | Server Utama GAGAL ({type(e_main).__name__}: {e_main}) "
-                f"→ FAILOVER ke Server Cadangan...")
+        if method != "GET":
+            conn.sendall(build_error_response(405, "Method Not Allowed"))
+            log("PROXY", f"{client_ip} {method} {path} - 405")
+            return
 
-            # Failover ke Server Cadangan
-            try:
-                response_data = forward_to_server(backup_ip, BACKUP_SERVER_TCP_PORT, raw_request)
-                server_used   = f"Server Cadangan ({backup_ip}:{BACKUP_SERVER_TCP_PORT})"
+        log("PROXY", f"{client_ip} GET {path}")
 
-            except (ConnectionRefusedError, socket.timeout, OSError) as e_backup:
-                log("PROXY",
-                    f"{client_ip}:{client_port} | Server Cadangan juga GAGAL "
-                    f"({type(e_backup).__name__}: {e_backup}) → 504")
-                # Kedua server mati → 504
-                conn.sendall(
-                    build_error_response(
-                        504, "Gateway Timeout",
-                        "Kedua server (Utama dan Cadangan) tidak dapat dijangkau."
-                    )
-                )
-                elapsed_ms = (time.perf_counter() - t_start) * 1000
-                log("PROXY",
-                    f"{client_ip}:{client_port} | GET {path} | 504 | {elapsed_ms:.2f}ms")
-                return
+        # ── CEK CACHE ──
+        cached = get_from_cache(path)
+        if cached:
+            elapsed = (datetime.datetime.now() - start_time).total_seconds() * 1000
+            conn.sendall(cached)
+            log("CACHE", f"HIT  | {path} | {len(cached)} bytes | {elapsed:.1f}ms")
+            return
 
-        # ── 5. Simpan ke cache & kirim ke client ─────────────────────────────
-        write_cache(cache_key, response_data)
-        conn.sendall(response_data)
+        # ── CACHE MISS → forward ke web server ──
+        log("CACHE", f"MISS | {path} → forwarding ke server")
 
-        elapsed_ms = (time.perf_counter() - t_start) * 1000
-        log("PROXY",
-            f"{client_ip}:{client_port} | GET {path} | "
-            f"MISS → {server_used} | {elapsed_ms:.2f}ms | "
-            f"{len(response_data)} bytes → cached & sent")
+        clean_request = f"GET {path} HTTP/1.1\r\nHost: {SERVER_HOST}:{SERVER_PORT}\r\nConnection: close\r\n\r\n"
+        response, error = forward_to_server(clean_request.encode())
 
-    except socket.timeout:
-        log("PROXY", f"{client_ip}:{client_port} | TIMEOUT menerima request dari client")
+        if error:
+            if "timeout" in error:
+                conn.sendall(build_error_response(504, "Gateway Timeout", f"Web server tidak merespons: {error}"))
+                log("PROXY", f"{client_ip} GET {path} - 504 Gateway Timeout ({error})")
+            else:
+                conn.sendall(build_error_response(502, "Bad Gateway", f"Error dari server: {error}"))
+                log("PROXY", f"{client_ip} GET {path} - 502 Bad Gateway ({error})")
+            return
+
+        try:
+            response_text = response.split(b"\r\n")[0].decode("utf-8", errors="replace")
+            status_code = int(response_text.split(" ")[1])
+        except Exception:
+            status_code = 0
+
+        if status_code == 200:
+            save_to_cache(path, response)
+            log("CACHE", f"STORED | {path} | {len(response)} bytes")
+        else:
+            log("PROXY", f"Tidak di-cache (status {status_code})")
+
+        elapsed = (datetime.datetime.now() - start_time).total_seconds() * 1000
+        conn.sendall(response)
+        log("PROXY", f"{client_ip} GET {path} - {status_code} | {elapsed:.1f}ms")
+
     except Exception as e:
-        log("PROXY", f"{client_ip}:{client_port} | EXCEPTION: {e}")
+        log("PROXY", f"Error handling {client_ip}: {e}")
         try:
-            conn.sendall(build_error_response(500, "Internal Server Error", str(e)))
+            conn.sendall(build_error_response(500, "Internal Proxy Error", str(e)))
         except Exception:
             pass
     finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────
+#  UDP LISTENER (QoS Pass-through)
+# ─────────────────────────────────────────
+def start_udp_listener():
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind((UDP_HOST, UDP_PORT))
+    log("UDP", f"QoS Listener aktif di port {UDP_PORT}")
+
+    while True:
         try:
-            conn.close()
-        except Exception:
-            pass
+            data, addr = server.recvfrom(1024)
+            log("UDP", f"Diterima {len(data)} bytes dari {addr[0]}:{addr[1]} | payload: {data.decode('utf-8', errors='replace')}")
+            # Pantulkan kembali ke client (echo)
+            server.sendto(data, addr)
+            log("UDP", f"Echo {len(data)} bytes → {addr[0]}:{addr[1]}")
+        except Exception as e:
+            log("UDP", f"Error: {e}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PROXY SERVER UTAMA
-# ─────────────────────────────────────────────────────────────────────────────
-def run_proxy(main_ip: str, backup_ip: str):
-    """Menjalankan proxy server: listen, accept, spawn thread per client."""
-    os.makedirs(CACHE_DIR, exist_ok=True)
-
+# ─────────────────────────────────────────
+#  MAIN: PROXY SERVER
+# ─────────────────────────────────────────
+def start_proxy():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((PROXY_HOST, PROXY_PORT))
-    server.listen(100)
-
-    print("=" * 65)
-    print("  PROXY SERVER - Tugas Besar Jaringan Komputer")
-    print(f"  Listen       : {PROXY_HOST}:{PROXY_PORT}")
-    print(f"  Server Utama : {main_ip}:{MAIN_SERVER_TCP_PORT}")
-    print(f"  Srv Cadangan : {backup_ip}:{BACKUP_SERVER_TCP_PORT}")
-    print(f"  Cache Dir    : {CACHE_DIR}")
-    print("=" * 65)
-    log("PROXY", "Siap menerima koneksi...")
+    server.listen(50)
+    log("PROXY", f"Listening on port {PROXY_PORT}")
+    log("PROXY", f"Forwarding ke Web Server {SERVER_HOST}:{SERVER_PORT}")
+    log("PROXY", f"Cache dir: {CACHE_DIR}")
 
     while True:
         try:
             conn, addr = server.accept()
-            t = threading.Thread(
-                target=handle_client,
-                args=(conn, addr, main_ip, backup_ip),
-                daemon=True
-            )
+            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
             t.start()
-        except KeyboardInterrupt:
-            log("PROXY", "Proxy dihentikan.")
-            break
+            log("PROXY", f"Koneksi baru dari {addr[0]} — thread spawned (active: {threading.active_count()-1})")
         except Exception as e:
-            log("PROXY", f"Error accept: {e}")
-
-    server.close()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser(
-        description="Proxy Server dengan Caching & Failover - Tugas Besar Jarkom"
-    )
-    parser.add_argument(
-        "--main_ip", required=True,
-        help="IP Address Node 3 (Server Utama), contoh: 192.168.1.10"
-    )
-    parser.add_argument(
-        "--backup_ip", required=True,
-        help="IP Address Node 4 (Server Cadangan), contoh: 192.168.1.11"
-    )
-    args = parser.parse_args()
-
-    run_proxy(args.main_ip, args.backup_ip)
+            log("PROXY", f"Accept error: {e}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        # UDP listener di thread terpisah
+        udp_thread = threading.Thread(target=start_udp_listener, daemon=True)
+        udp_thread.start()
+
+        start_proxy()
+    except KeyboardInterrupt:
+        log("PROXY", "Proxy dihentikan.")
+        sys.exit(0)

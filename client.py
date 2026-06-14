@@ -1,256 +1,285 @@
 import socket
-import argparse
 import time
+import sys
 import datetime
 import math
-import sys
+import os
+import threading
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KONFIGURASI
-# ─────────────────────────────────────────────────────────────────────────────
-PROXY_PORT       = 8080
-DEFAULT_UDP_PORT = 9000
-PACKET_COUNT     = 10
-UDP_PAYLOAD_SIZE = 64    # byte, termasuk overhead teks "Ping <seq> <ts>"
-UDP_TIMEOUT      = 1.0   # detik, timeout per paket
-INTERVAL         = 0.5   # detik, jeda antar paket
+# ─────────────────────────────────────────
+#  KONFIGURASI
+# ─────────────────────────────────────────
+PROXY_HOST = "127.0.0.1"   
+PROXY_PORT = 8080
 
+SERVER_HOST = "127.0.0.1"  
+UDP_PORT_SERVER = 9090
+UDP_PORT_PROXY  = 9091
 
-def timestamp():
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+UDP_PACKET_COUNT = 10       
+UDP_TIMEOUT = 1.0           
+TCP_DEFAULT_PATH = "/HTML/index.html"  
 
+# Lock untuk mencegah output bertabrakan saat multi-request
+print_lock = threading.Lock()
 
-def log(label: str, msg: str):
-    print(f"[{timestamp()}] [{label}] {msg}", flush=True)
+# ─────────────────────────────────────────
+#  HELPER: LOGGING (OTOMATIS SIMPAN)
+# ─────────────────────────────────────────
+def log(tag, message):
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    log_entry = f"[{now}] [{tag}] {message}"
+    
+    with print_lock:
+        print(log_entry)
+        os.makedirs("logs", exist_ok=True)
+        try:
+            with open(os.path.join("logs", "log_client.txt"), "a", encoding="utf-8") as f:
+                f.write(log_entry + "\n")
+        except Exception as e:
+            print(f"Gagal menulis ke log file: {e}")
 
+def save_output_to_file(text_block):
+    with print_lock:
+        os.makedirs("logs", exist_ok=True)
+        try:
+            with open(os.path.join("logs", "hasil_client.txt"), "a", encoding="utf-8") as f:
+                f.write(text_block + "\n")
+        except Exception as e:
+            print(f"Gagal menyimpan output ke file: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODE TCP: Kirim GET ke Proxy, cetak response HTML
-# ─────────────────────────────────────────────────────────────────────────────
-def run_tcp(proxy_ip: str, url_path: str):
-    """
-    Mengirim satu HTTP GET request ke proxy (port 8080) dan mencetak
-    seluruh isi HTML response ke terminal.
-    """
-    proxy_port = PROXY_PORT
-
-    print("=" * 60)
-    print("  MODE TCP - HTTP GET via Proxy")
-    print(f"  Proxy    : {proxy_ip}:{proxy_port}")
-    print(f"  URL Path : {url_path}")
-    print("=" * 60)
-
-    t_start = time.perf_counter()
+# ─────────────────────────────────────────
+#  MODE TCP — HTTP CLIENT (CLIENT 1)
+# ─────────────────────────────────────────
+def mode_tcp(path, thread_id=""):
+    tag = f"TCP {thread_id}".strip()
+    log(tag, f"Mengirim GET {path} ke proxy {PROXY_HOST}:{PROXY_PORT}")
 
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(10)
-        s.connect((proxy_ip, proxy_port))
+        s.connect((PROXY_HOST, PROXY_PORT))
 
-        # Bangun HTTP/1.1 GET request secara manual
         request = (
-            f"GET {url_path} HTTP/1.1\r\n"
-            f"Host: {proxy_ip}:{proxy_port}\r\n"
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {PROXY_HOST}:{PROXY_PORT}\r\n"
             f"Connection: close\r\n"
-            f"User-Agent: TubesBesar-Client/1.0\r\n"
             f"\r\n"
         )
+        t_send = time.time()
         s.sendall(request.encode("utf-8"))
 
-        # Terima response penuh
         response = b""
         while True:
-            chunk = s.recv(65536)
-            if not chunk:
+            try:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            except socket.timeout:
                 break
-            response += chunk
 
+        t_recv = time.time()
         s.close()
 
-        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        rtt_ms = (t_recv - t_send) * 1000
 
-        # Pisahkan header dan body
+        if not response:
+            log(tag, "Tidak ada response dari proxy.")
+            return
+
         if b"\r\n\r\n" in response:
             header_part, body_part = response.split(b"\r\n\r\n", 1)
-            headers = header_part.decode("utf-8", errors="replace")
-            body    = body_part.decode("utf-8", errors="replace")
+            header_text = header_part.decode("utf-8", errors="replace")
+            status_line = header_text.split("\r\n")[0]
         else:
-            headers = response.decode("utf-8", errors="replace")
-            body    = ""
+            header_text = ""
+            status_line = "(tidak ada header)"
+            body_part = response
 
-        # Cetak header
-        print("\n─── HTTP RESPONSE HEADERS ───────────────────────────────────")
-        print(headers)
-        print("─── HTTP RESPONSE BODY ──────────────────────────────────────")
-        print(body)
-        print("─────────────────────────────────────────────────────────────")
-        log("TCP", f"Selesai | Total: {len(response)} bytes | RTT: {elapsed_ms:.2f}ms")
+        output_tcp = f"""
+{"═" * 60}
+  [{tag}] STATUS  : {status_line}
+  [{tag}] RTT     : {rtt_ms:.2f} ms
+  [{tag}] UKURAN  : {len(response)} bytes (header + body)
+{"═" * 60}
+── HEADER ──
+{header_text}
+── BODY (500 karakter pertama) ──
+{body_part[:500].decode("utf-8", errors="replace")}
+{"─" * 60}
+"""
+        with print_lock:
+            print(output_tcp)
+        save_output_to_file(output_tcp)
 
     except ConnectionRefusedError:
-        log("TCP", f"GAGAL: Proxy di {proxy_ip}:{proxy_port} tidak bisa dikoneksi.")
-        sys.exit(1)
+        log(tag, f"Koneksi ditolak — pastikan proxy berjalan di {PROXY_HOST}:{PROXY_PORT}")
     except socket.timeout:
-        log("TCP", "GAGAL: Timeout saat menunggu response dari proxy.")
-        sys.exit(1)
+        log(tag, "Timeout — proxy tidak merespons dalam 10 detik")
     except Exception as e:
-        log("TCP", f"EXCEPTION: {e}")
-        sys.exit(1)
+        log(tag, f"Error: {e}")
 
+# ─────────────────────────────────────────
+#  MODE TCP MULTI — KONKUREN (CLIENT 2)
+# ─────────────────────────────────────────
+def mode_tcp_multi(path, num_requests):
+    log("TCP_MULTI", f"Memulai {num_requests} request konkuren secara bersamaan ke {PROXY_HOST}:{PROXY_PORT}...")
+    
+    threads = []
+    for i in range(1, num_requests + 1):
+        t = threading.Thread(target=mode_tcp, args=(path, f"(Req-{i})"))
+        threads.append(t)
+        t.start()
+        
+    for t in threads:
+        t.join()
+        
+    log("TCP_MULTI", "Semua request konkuren selesai dieksekusi.")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODE UDP: QoS Test (RTT, Loss, Jitter, Throughput)
-# ─────────────────────────────────────────────────────────────────────────────
-def run_udp(server_ip: str, udp_port: int, count: int, interval: float):
-    """
-    Mengirim `count` paket UDP ke server (QoS Echo Server).
-    Menghitung statistik: Min/Avg/Max RTT, Packet Loss, Jitter, Throughput.
-    """
-    print("=" * 60)
-    print("  MODE UDP - QoS Test (Echo)")
-    print(f"  Target  : {server_ip}:{udp_port}")
-    print(f"  Paket   : {count} × interval {interval}s")
-    print("=" * 60)
+# ─────────────────────────────────────────
+#  MODE UDP — QoS PINGER
+# ─────────────────────────────────────────
+def mode_udp(target_host=None, count=None, target_port=None):
+    host  = target_host or SERVER_HOST
+    n     = count or UDP_PACKET_COUNT
+    port = target_port or UDP_PORT_SERVER
+
+    log("UDP", f"Memulai QoS ping ke {host}:{port} — {n} paket")
+    print()
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(UDP_TIMEOUT)
 
-    rtts          = []      # daftar RTT (ms) per paket yang berhasil
-    sent          = 0
-    received      = 0
-    total_bytes   = 0
-    t_test_start  = time.perf_counter()
+    rtt_list      = []  
+    lost          = 0
+    total_payload = 0
+    t_start       = time.time()
 
-    for seq in range(1, count + 1):
-        ts_send = time.perf_counter()
-        ts_str  = f"{ts_send:.6f}"
-        payload = f"Ping {seq} {ts_str}"
-
-        # Pad payload agar mencapai UDP_PAYLOAD_SIZE byte (opsional, bisa lebih kecil)
-        payload_bytes = payload.encode("utf-8")
-        sent += 1
+    for seq in range(1, n + 1):
+        timestamp = time.time()
+        payload   = f"Ping {seq} {timestamp}".encode("utf-8")
+        total_payload += len(payload)
 
         try:
-            s.sendto(payload_bytes, (server_ip, udp_port))
-            echo, _ = s.recvfrom(65535)
+            s.sendto(payload, (host, port))
+            t_send = time.time()
 
-            ts_recv = time.perf_counter()
-            rtt_ms  = (ts_recv - ts_send) * 1000
-            rtts.append(rtt_ms)
-            received       += 1
-            total_bytes    += len(echo)
+            data, _ = s.recvfrom(1024)
+            t_recv  = time.time()
 
-            log("UDP",
-                f"Paket {seq:>3}/{count} | "
-                f"RTT={rtt_ms:.3f}ms | "
-                f"{len(payload_bytes)} bytes | "
-                f"RECV: '{echo.decode('utf-8', errors='replace')}'")
+            rtt_ms = (t_recv - t_send) * 1000
+            rtt_list.append(rtt_ms)
+
+            echo_ok = (data == payload)
+            status  = "OK" if echo_ok else "ECHO MISMATCH"
+            
+            loop_log = f"  Paket {seq:>3}: RTT = {rtt_ms:7.3f} ms  [{status}]"
+            with print_lock:
+                print(loop_log)
+            save_output_to_file(loop_log) 
 
         except socket.timeout:
-            log("UDP", f"Paket {seq:>3}/{count} | TIMEOUT (>{UDP_TIMEOUT}s) | LOST")
+            lost += 1
+            loop_log = f"  Paket {seq:>3}: Request timed out"
+            with print_lock:
+                print(loop_log)
+            save_output_to_file(loop_log)
 
-        if seq < count:
-            time.sleep(interval)
+        time.sleep(0.1)
 
-    t_test_end    = time.perf_counter()
-    total_time_s  = t_test_end - t_test_start
+    t_end    = time.time()
+    duration = t_end - t_start
     s.close()
 
-    # ── Hitung Statistik ──────────────────────────────────────────────────────
-    loss_pct = ((sent - received) / sent * 100) if sent > 0 else 100.0
+    received   = len(rtt_list)
+    loss_pct   = (lost / n) * 100
+    throughput = (total_payload * 8) / duration / 1000  
 
-    if rtts:
-        rtt_min = min(rtts)
-        rtt_max = max(rtts)
-        rtt_avg = sum(rtts) / len(rtts)
+    if received > 0:
+        rtt_min = min(rtt_list)
+        rtt_avg = sum(rtt_list) / received
+        rtt_max = max(rtt_list)
 
-        # Jitter = standar deviasi dari selisih RTT antar paket berurutan
-        if len(rtts) >= 2:
-            diffs  = [abs(rtts[i] - rtts[i - 1]) for i in range(1, len(rtts))]
-            avg_d  = sum(diffs) / len(diffs)
-            jitter = math.sqrt(sum((d - avg_d) ** 2 for d in diffs) / len(diffs))
+        if received > 1:
+            diffs   = [abs(rtt_list[i] - rtt_list[i-1]) for i in range(1, received)]
+            mean_d  = sum(diffs) / len(diffs)
+            variance = sum((d - mean_d) ** 2 for d in diffs) / len(diffs)
+            jitter  = math.sqrt(variance)
         else:
             jitter = 0.0
-
-        # Throughput (kbps) = total bytes diterima × 8 bit ÷ total waktu (detik) ÷ 1000
-        throughput_kbps = (total_bytes * 8) / total_time_s / 1000 if total_time_s > 0 else 0.0
-
     else:
-        rtt_min = rtt_max = rtt_avg = jitter = throughput_kbps = 0.0
+        rtt_min = rtt_avg = rtt_max = jitter = 0.0
 
-    # ── Cetak Laporan ─────────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("  HASIL QoS UDP - STATISTIK")
-    print("=" * 60)
-    print(f"  Target         : {server_ip}:{udp_port}")
-    print(f"  Paket Dikirim  : {sent}")
-    print(f"  Paket Diterima : {received}")
-    print(f"  Packet Loss    : {loss_pct:.1f}%")
-    print(f"  ─────────────────────────────")
-    print(f"  RTT Min        : {rtt_min:.3f} ms")
-    print(f"  RTT Avg        : {rtt_avg:.3f} ms")
-    print(f"  RTT Max        : {rtt_max:.3f} ms")
-    print(f"  Jitter (StdDev): {jitter:.3f} ms")
-    print(f"  Throughput     : {throughput_kbps:.3f} kbps")
-    print(f"  Total Waktu    : {total_time_s:.3f} s")
-    print("=" * 60)
+    output_udp = f"""
+{"═" * 60}
+  QoS STATISTIK — {host}:{port}
+{"═" * 60}
+  Paket dikirim   : {n}
+  Paket diterima  : {received}
+  Packet Loss     : {loss_pct:.1f}%
+  RTT min         : {rtt_min:.3f} ms
+  RTT avg         : {rtt_avg:.3f} ms
+  RTT max         : {rtt_max:.3f} ms
+  Jitter          : {jitter:.3f} ms
+  Throughput      : {throughput:.3f} kbps
+{"═" * 60}
+"""
+    with print_lock:
+        print(output_udp)
+    save_output_to_file(output_udp)
 
-    if loss_pct == 100.0:
-        print("\n[PERINGATAN] Semua paket hilang! Pastikan UDP QoS server aktif.")
-        print(f"             Periksa apakah webserver.py berjalan di {server_ip}:{udp_port}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser(
-        description="Client TCP/UDP - Tugas Besar Jaringan Komputer"
-    )
-    parser.add_argument(
-        "-mode", required=True, choices=["tcp", "udp"],
-        help="Mode operasi: 'tcp' untuk HTTP GET, 'udp' untuk QoS Test"
-    )
-
-    # Argumen TCP
-    parser.add_argument(
-        "-proxy_ip", default=None,
-        help="[TCP] IP Address Proxy (Node 2), contoh: 192.168.1.20"
-    )
-    parser.add_argument(
-        "-url", default="/index.html",
-        help="[TCP] URL path yang diminta, contoh: /osi.html (default: /index.html)"
-    )
-
-    # Argumen UDP
-    parser.add_argument(
-        "-server_ip", default=None,
-        help="[UDP] IP Address Server Utama atau Cadangan, contoh: 192.168.1.10"
-    )
-    parser.add_argument(
-        "-udp_port", type=int, default=DEFAULT_UDP_PORT,
-        help=f"[UDP] Port UDP tujuan (default: {DEFAULT_UDP_PORT})"
-    )
-    parser.add_argument(
-        "-count", type=int, default=PACKET_COUNT,
-        help=f"[UDP] Jumlah paket yang dikirim (default: {PACKET_COUNT})"
-    )
-    parser.add_argument(
-        "-interval", type=float, default=INTERVAL,
-        help=f"[UDP] Interval antar paket dalam detik (default: {INTERVAL})"
-    )
-
-    args = parser.parse_args()
-
-    if args.mode == "tcp":
-        if not args.proxy_ip:
-            parser.error("-proxy_ip wajib diisi untuk mode TCP")
-        run_tcp(args.proxy_ip, args.url)
-
-    elif args.mode == "udp":
-        if not args.server_ip:
-            parser.error("-server_ip wajib diisi untuk mode UDP")
-        run_udp(args.server_ip, args.udp_port, args.count, args.interval)
-
+# ─────────────────────────────────────────
+#  HELPER: USAGE
+# ─────────────────────────────────────────
+def print_usage():
+    print("""
+Cara penggunaan:
+  Client 1 (Single Request):
+    python client.py -mode tcp
+  Client 2 (Multi Request/Konkuren):
+    python client.py -mode tcp_multi -n 10
+  Mode UDP (QoS):
+    python client.py -mode udp
+""")
 
 if __name__ == "__main__":
-    main()
+    args = sys.argv[1:]
+
+    def get_arg(flag, default=None):
+        if flag in args:
+            idx = args.index(flag)
+            if idx + 1 < len(args):
+                return args[idx + 1]
+        return default
+
+    mode = get_arg("-mode", "").lower()
+    path = get_arg("-path", TCP_DEFAULT_PATH)
+    host = get_arg("-host", None)
+    count_str = get_arg("-count", None)
+    
+    # Untuk multi request
+    n_multi_str = get_arg("-n", "5")
+    try:
+        n_multi = int(n_multi_str)
+    except ValueError:
+        n_multi = 5
+
+    try:
+        count = int(count_str) if count_str and count_str.isdigit() else None
+    except ValueError:
+        count = None
+
+    target = get_arg("-target", "server") 
+
+    if mode == "tcp":
+        mode_tcp(path)
+    elif mode == "tcp_multi":
+        mode_tcp_multi(path, n_multi)
+    elif mode == "udp":
+        if target == "proxy":
+            mode_udp(target_host=PROXY_HOST, count=count, target_port=UDP_PORT_PROXY)
+        else:
+            mode_udp(target_host=SERVER_HOST, count=count, target_port=UDP_PORT_SERVER)
+    else:
+        print_usage()

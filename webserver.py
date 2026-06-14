@@ -1,69 +1,82 @@
 import socket
 import threading
-import argparse
 import os
 import sys
 import datetime
-import mimetypes
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KONFIGURASI
-# ─────────────────────────────────────────────────────────────────────────────
-BIND_HOST   = "0.0.0.0"       # Bind ke semua interface agar bisa diakses lewat LAN
-HTML_ROOT   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "HTML")
+# ─────────────────────────────────────────
+#  KONFIGURASI
+# ─────────────────────────────────────────
+TCP_HOST = "0.0.0.0"
+TCP_PORT = 8000
+UDP_HOST = "0.0.0.0"
+UDP_PORT = 9090
 
-# Peta URL path → nama file relatif terhadap HTML_ROOT
-ROUTE_MAP = {
-    "/":                  "index.html",
-    "/index.html":        "index.html",
-    "/osi.html":          "osi.html",
-    "/tcpip.html":        "tcpip.html",
-    "/qos.html":          "qos.html",
-    "/implementation.html": "implementation.html",
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UTILITAS
-# ─────────────────────────────────────────────────────────────────────────────
-def timestamp():
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+# Direktori tempat file HTML disimpan
+BASE_DIR = "HTML"
 
 
-def log(label: str, msg: str):
-    print(f"[{timestamp()}] [{label}] {msg}", flush=True)
+# ─────────────────────────────────────────
+#  HELPER: LOGGING (OTOMATIS SIMPAN)
+# ─────────────────────────────────────────
+def log(tag, message):
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    log_entry = f"[{now}] [{tag}] {message}"
+    print(log_entry)
+    
+    # Buat folder 'logs' jika belum ada bray
+    os.makedirs("logs", exist_ok=True)
+    
+    try:
+        # Simpan di dalam folder logs/
+        with open(os.path.join("logs", "log_server.txt"), "a", encoding="utf-8") as f:
+            f.write(log_entry + "\n")
+    except Exception as e:
+        print(f"Gagal menulis ke log file: {e}")
 
 
-def build_response(status_code: int, status_text: str, body: bytes,
-                   content_type: str = "text/html; charset=utf-8") -> bytes:
-    """Membangun HTTP/1.1 response secara manual."""
-    headers = (
+# ─────────────────────────────────────────
+#  HELPER: MIME TYPE
+# ─────────────────────────────────────────
+def get_mime_type(path):
+    if path.endswith(".html") or path.endswith(".htm"):
+        return "text/html; charset=utf-8"
+    elif path.endswith(".css"):
+        return "text/css"
+    elif path.endswith(".js"):
+        return "application/javascript"
+    elif path.endswith(".png"):
+        return "image/png"
+    elif path.endswith(".jpg") or path.endswith(".jpeg"):
+        return "image/jpeg"
+    elif path.endswith(".ico"):
+        return "image/x-icon"
+    else:
+        return "application/octet-stream"
+
+
+# ─────────────────────────────────────────
+#  HELPER: BANGUN HTTP RESPONSE
+# ─────────────────────────────────────────
+def build_response(status_code, status_text, body_bytes, content_type="text/html; charset=utf-8"):
+    header = (
         f"HTTP/1.1 {status_code} {status_text}\r\n"
         f"Content-Type: {content_type}\r\n"
-        f"Content-Length: {len(body)}\r\n"
+        f"Content-Length: {len(body_bytes)}\r\n"
         f"Connection: close\r\n"
-        f"Server: PythonWebServer/1.0\r\n"
-        f"Date: {datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')}\r\n"
         f"\r\n"
     )
-    return headers.encode("utf-8") + body
+    return header.encode("utf-8") + body_bytes
 
 
-def read_file(filepath: str) -> bytes:
-    """Membaca file biner dari disk."""
-    with open(filepath, "rb") as f:
-        return f.read()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TCP: HANDLER PER KONEKSI (dijalankan di thread terpisah)
-# ─────────────────────────────────────────────────────────────────────────────
-def handle_tcp_client(conn: socket.socket, addr: tuple, tcp_port: int):
-    """Memparsing HTTP GET request dan mengembalikan response."""
-    client_ip, client_port = addr
+# ─────────────────────────────────────────
+#  HANDLE SATU KONEKSI CLIENT (TCP)
+# ─────────────────────────────────────────
+def handle_tcp_client(conn, addr):
+    client_ip = addr[0]
     try:
-        # Terima request (maks 4096 byte cukup untuk request GET sederhana)
+        # Terima request (maksimal 4KB untuk header)
         raw = b""
-        conn.settimeout(10)
         while b"\r\n\r\n" not in raw:
             chunk = conn.recv(4096)
             if not chunk:
@@ -73,197 +86,116 @@ def handle_tcp_client(conn: socket.socket, addr: tuple, tcp_port: int):
         if not raw:
             return
 
-        # ── Parsing manual HTTP request ──────────────────────────────────────
-        request_line = raw.split(b"\r\n")[0].decode("utf-8", errors="replace")
-        parts = request_line.split()
-        if len(parts) < 2:
-            # Request tidak valid
-            response = build_response(400, "Bad Request", b"<h1>400 Bad Request</h1>")
-            conn.sendall(response)
-            log("TCP", f"{client_ip}:{client_port} | BAD REQUEST | port={tcp_port}")
+        # Parse request line
+        try:
+            request_text = raw.decode("utf-8", errors="replace")
+            request_line = request_text.split("\r\n")[0]
+            parts = request_line.split(" ")
+            method = parts[0]
+            path = parts[1] if len(parts) > 1 else "/"
+        except Exception:
+            # Request malformed
+            body = b"<h1>400 Bad Request</h1>"
+            conn.sendall(build_response(400, "Bad Request", body))
+            log("TCP", f"{client_ip} - 400 Bad Request (malformed)")
             return
 
-        method = parts[0]
-        path   = parts[1]
-
-        # Hanya layani GET
+        # Hanya support GET
         if method != "GET":
             body = b"<h1>405 Method Not Allowed</h1>"
-            response = build_response(405, "Method Not Allowed", body)
-            conn.sendall(response)
-            log("TCP", f"{client_ip}:{client_port} | 405 | {method} {path}")
+            conn.sendall(build_response(405, "Method Not Allowed", body))
+            log("TCP", f"{client_ip} {method} {path} - 405")
             return
 
-        # ── Routing: URL → file ──────────────────────────────────────────────
-        status_code = 200
-        status_text = "OK"
+        # Normalisasi path
+        if path == "/":
+            path = "/index.html"
 
-        # Cek apakah path ada di route map
-        if path in ROUTE_MAP:
-            filename = ROUTE_MAP[path]
-            filepath = os.path.join(HTML_ROOT, filename)
-        else:
-            # Coba langsung sebagai file (untuk aset, CSS, dll.)
-            # Pastikan tidak ada path traversal (keamanan dasar)
-            safe_path = os.path.normpath(path.lstrip("/"))
-            filepath  = os.path.join(HTML_ROOT, safe_path)
-            filename  = safe_path
+        # Keamanan: cegah path traversal (../../)
+        safe_path = os.path.normpath(path.lstrip("/"))
+        if safe_path.startswith(".."):
+            body = b"<h1>403 Forbidden</h1>"
+            conn.sendall(build_response(403, "Forbidden", body))
+            log("TCP", f"{client_ip} GET {path} - 403 Forbidden (path traversal)")
+            return
 
-        # ── Baca file & kirim response ────────────────────────────────────────
+        file_path = os.path.join(BASE_DIR, safe_path)
+
+        # Coba baca file
         try:
-            body = read_file(filepath)
-
-            # Deteksi Content-Type otomatis
-            mime, _ = mimetypes.guess_type(filepath)
-            if mime is None:
-                mime = "application/octet-stream"
-            if "text" in mime:
-                mime += "; charset=utf-8"
-
-            response = build_response(200, "OK", body, content_type=mime)
-            status_code = 200
-            status_text = "OK"
+            with open(file_path, "rb") as f:
+                body = f.read()
+            mime = get_mime_type(file_path)
+            response = build_response(200, "OK", body, mime)
+            conn.sendall(response)
+            log("TCP", f"{client_ip} GET {path} - 200 OK ({len(body)} bytes)")
 
         except FileNotFoundError:
-            # Coba kirim halaman 404 kustom
-            err_file = os.path.join(HTML_ROOT, "status", "404.html")
-            try:
-                body = read_file(err_file)
-            except FileNotFoundError:
-                body = b"<h1>404 Not Found</h1>"
-            response   = build_response(404, "Not Found", body)
-            status_code = 404
-            status_text = "Not Found"
+            body = b"<h1>404 Not Found</h1><p>File tidak ditemukan.</p>"
+            conn.sendall(build_response(404, "Not Found", body))
+            log("TCP", f"{client_ip} GET {path} - 404 Not Found")
 
         except Exception as e:
-            # Error membaca file → 500
-            err_file = os.path.join(HTML_ROOT, "status", "500.html")
-            try:
-                body = read_file(err_file)
-            except FileNotFoundError:
-                body = b"<h1>500 Internal Server Error</h1>"
-            response   = build_response(500, "Internal Server Error", body)
-            status_code = 500
-            status_text = "Internal Server Error"
-            log("TCP", f"ERROR membaca file '{filepath}': {e}")
+            body = f"<h1>500 Internal Server Error</h1><p>{e}</p>".encode()
+            conn.sendall(build_response(500, "Internal Server Error", body))
+            log("TCP", f"{client_ip} GET {path} - 500 Internal Server Error: {e}")
 
-        conn.sendall(response)
-        log("TCP",
-            f"{client_ip}:{client_port} | {status_code} {status_text} | "
-            f"GET {path} | file={filename} | port={tcp_port}")
-
-    except socket.timeout:
-        log("TCP", f"{client_ip}:{client_port} | TIMEOUT saat menerima request")
     except Exception as e:
-        log("TCP", f"{client_ip}:{client_port} | EXCEPTION: {e}")
+        log("TCP", f"Error handling client {client_ip}: {e}")
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        conn.close()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TCP SERVER
-# ─────────────────────────────────────────────────────────────────────────────
-def run_tcp_server(tcp_port: int):
-    """Menjalankan TCP server dengan multithreading."""
+# ─────────────────────────────────────────
+#  TCP SERVER (HTTP)
+# ─────────────────────────────────────────
+def start_tcp_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((BIND_HOST, tcp_port))
+    server.bind((TCP_HOST, TCP_PORT))
     server.listen(50)
-    log("TCP", f"Server TCP siap di {BIND_HOST}:{tcp_port} | HTML_ROOT={HTML_ROOT}")
+    log("TCP", f"HTTP Server running on port {TCP_PORT}")
 
     while True:
         try:
             conn, addr = server.accept()
-            t = threading.Thread(
-                target=handle_tcp_client,
-                args=(conn, addr, tcp_port),
-                daemon=True
-            )
+            t = threading.Thread(target=handle_tcp_client, args=(conn, addr), daemon=True)
             t.start()
-        except KeyboardInterrupt:
-            log("TCP", "Server dihentikan.")
-            break
+            log("TCP", f"New connection from {addr[0]} — thread spawned (active: {threading.active_count()-1})")
         except Exception as e:
-            log("TCP", f"Error saat menerima koneksi: {e}")
-
-    server.close()
+            log("TCP", f"Accept error: {e}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UDP QoS ECHO SERVER
-# ─────────────────────────────────────────────────────────────────────────────
-def run_udp_server(udp_port: int):
-    """UDP Echo Server: memantulkan kembali setiap paket tanpa mengubah payload."""
+# ─────────────────────────────────────────
+#  UDP SERVER (QoS Echo)
+# ─────────────────────────────────────────
+def start_udp_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((BIND_HOST, udp_port))
-    log("UDP", f"QoS Echo Server siap di {BIND_HOST}:{udp_port}")
+    server.bind((UDP_HOST, UDP_PORT))
+    log("UDP", f"QoS Echo Server running on port {UDP_PORT}")
 
     while True:
         try:
-            data, addr = server.recvfrom(65535)
-            # Echo balik tanpa modifikasi
+            data, addr = server.recvfrom(1024)
             server.sendto(data, addr)
-            log("UDP", f"{addr[0]}:{addr[1]} | ECHO | {len(data)} bytes | '{data.decode('utf-8', errors='replace')}'")
-        except KeyboardInterrupt:
-            log("UDP", "Server dihentikan.")
-            break
+            log("UDP", f"Echo {len(data)} bytes -> {addr[0]}:{addr[1]} | payload: {data.decode('utf-8', errors='replace')}")
         except Exception as e:
             log("UDP", f"Error: {e}")
 
-    server.close()
 
+# ─────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────
+if __name__ == "__main__":
+    log("MAIN", "Starting Web Server (TCP + UDP)...")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser(
-        description="Web Server (TCP/HTTP + UDP QoS Echo) - Tugas Besar Jarkom"
-    )
-    parser.add_argument(
-        "--tcp_port", type=int, default=8000,
-        help="Port TCP/HTTP (default: 8000 untuk Server Utama, 8001 untuk Cadangan)"
-    )
-    parser.add_argument(
-        "--udp_port", type=int, default=9000,
-        help="Port UDP QoS (default: 9000 untuk Server Utama, 9001 untuk Cadangan)"
-    )
-    args = parser.parse_args()
-
-    if not os.path.isdir(HTML_ROOT):
-        print(f"[ERROR] Folder HTML tidak ditemukan: {HTML_ROOT}")
-        print("Pastikan folder 'HTML/' ada di direktori yang sama dengan webserver.py")
-        sys.exit(1)
-
-    print("=" * 60)
-    print("  WEB SERVER - Tugas Besar Jaringan Komputer")
-    print(f"  TCP Port : {args.tcp_port}")
-    print(f"  UDP Port : {args.udp_port}")
-    print(f"  HTML Root: {HTML_ROOT}")
-    print("=" * 60)
-
-    # Jalankan TCP dan UDP server secara paralel di thread terpisah
-    tcp_thread = threading.Thread(
-        target=run_tcp_server, args=(args.tcp_port,), daemon=True
-    )
-    udp_thread = threading.Thread(
-        target=run_udp_server, args=(args.udp_port,), daemon=True
-    )
-
-    tcp_thread.start()
+    # UDP server di thread terpisah
+    udp_thread = threading.Thread(target=start_udp_server, daemon=True)
     udp_thread.start()
 
+    # TCP server di main thread (blocking)
     try:
-        tcp_thread.join()
-        udp_thread.join()
+        start_tcp_server()
     except KeyboardInterrupt:
-        print("\n[INFO] Server dihentikan oleh user (Ctrl+C).")
+        log("MAIN", "Server dihentikan.")
         sys.exit(0)
-
-
-if __name__ == "__main__":
-    main()
