@@ -1,2 +1,3 @@
 # TUBES-JARKOM
-arsha hadir
+Nama anggota:
+Arsha Athallah Putra Satya (103012400062)
